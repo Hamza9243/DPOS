@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DPOS</string>
+    <string name="title_activity_main">DPOS</string>
+    <string name="package_name">com.dpos.app</string>
+    <string name="custom_url_scheme">com.dpos.app</string>
+    <string name="server_client_id">256497540257-1t5jgh25ktiic3eav79lkdk4k3au0m5l.apps.googleusercontent.com</string>
+</resources>

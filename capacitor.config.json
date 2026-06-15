@@ -1,0 +1,12 @@
+{
+  "appId": "com.devorions.dpos",
+  "appName": "DPOS",
+  "webDir": "dist",
+  "plugins": {
+    "GoogleAuth": {
+      "scopes": ["profile", "email"],
+      "serverClientId": "256497540257-1t5jgh25ktiic3eav79lkdk4k3au0m5l.apps.googleusercontent.com",
+      "forceCodeForRefreshToken": true
+    }
+  }
+}
