@@ -22,4 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-qq  
+
+# Supabase CLI local state (contains project ref / account email, not for git)
+supabase/.temp/

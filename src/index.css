@@ -4,9 +4,77 @@
 
 :root {
   --theme-color: #1565C0;
+  --toast-success-border: rgba(34,197,94,0.35);
+  --toast-success-text: #16a34a;
+  --toast-error-border: rgba(239,68,68,0.35);
+  --toast-error-text: #dc2626;
+  --toast-warning-border: rgba(245,158,11,0.35);
+  --toast-warning-text: #d97706;
+  --toast-info-border: rgba(0,145,240,0.35);
+  --toast-info-text: #0369a1;
+}
+
+.dark {
+  --toast-success-border: rgba(34,197,94,0.25);
+  --toast-success-text: #4ade80;
+  --toast-error-border: rgba(239,68,68,0.25);
+  --toast-error-text: #f87171;
+  --toast-warning-border: rgba(245,158,11,0.25);
+  --toast-warning-text: #fbbf24;
+  --toast-info-border: rgba(0,145,240,0.25);
+  --toast-info-text: #5cc4ff;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 body {
-  background: #f0f4ff;
+  background: #ffffff;
+  overscroll-behavior-y: none;
+}
+
+/* Thin, unobtrusive scrollbars for the premium look (desktop only — touch
+   devices already hide native scrollbars). */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(21, 101, 192, 0.18);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(21, 101, 192, 0.32);
+}
+
+/* Frosted glass surface — used on the sidebar/splash over dark gradients. */
+.glass {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* Skeleton loading shimmer for premium loading states. */
+.skeleton {
+  background: linear-gradient(90deg, #eef2f9 25%, #f8fafc 37%, #eef2f9 63%);
+  background-size: 400px 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 

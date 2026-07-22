@@ -7,17 +7,18 @@ import { showToast } from "../components/Toast";
 import { printThermalReceipt } from "../lib/printReceipt";
 
 const statusStyles = {
-  Completed: "bg-green-50 text-green-600 border-green-100",
-  Pending: "bg-yellow-50 text-yellow-600 border-yellow-100",
-  Cancelled: "bg-red-50 text-red-500 border-red-100",
+  Completed: "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
+  Pending: "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400 border-yellow-500/20",
+  Cancelled: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20",
 };
 
 const statusIcons = { Completed: "✅", Pending: "⏳", Cancelled: "❌" };
 
 export default function Orders({ businessId, business, role = "admin" }) {
-  const themeColor = "#1565C0";
-  // Cashier gets the same Orders powers as admin (status, return, edit items).
-  const isAdmin = true;
+  // Admin + Manager can change status, return, and edit items. Cashier is
+  // view + invoice/print only (enforced server-side too — see the RPCs in
+  // 002_full_rls_and_orders.sql, this is UI gating on top of that).
+  const isAdmin = role === "admin" || role === "manager";
   const [orders, setOrders] = useState([]);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("All");
@@ -49,65 +50,40 @@ export default function Orders({ businessId, business, role = "admin" }) {
     if (data) setProducts(data);
   };
 
-  // Recalculate the order total from its current items, then refresh the list/modal.
-  const recalcAndReload = async (orderId) => {
-    const { data: items } = await supabase.from("order_items").select("*").eq("order_id", orderId);
-    const total = (items || []).reduce((s, i) => s + i.price * i.quantity, 0);
-    await supabase.from("orders").update({ total }).eq("id", orderId);
-    await loadOrders();
-  };
-
-  // Adjust a product's stock by `delta` (matched by name, same as handleReturn).
-  const adjustStock = async (productName, delta) => {
-    const { data: product } = await supabase.from("products").select("stock").eq("business_id", businessId).ilike("name", productName).maybeSingle();
-    if (product && product.stock != null) {
-      await supabase.from("products").update({ stock: product.stock + delta }).eq("business_id", businessId).ilike("name", productName);
+  // Every mutation below goes through an RPC (002_full_rls_and_orders.sql) so
+  // stock/total are recalculated atomically and by product_id, not by
+  // matching on product name. The RPC itself re-checks the caller's role.
+  const runOrderRpc = async (fn, args, successMsg) => {
+    const { data, error } = await supabase.rpc(fn, args);
+    if (error) {
+      showToast(error.message || "Action failed", "error");
+      return false;
     }
+    await loadOrders();
+    await loadProducts();
+    if (successMsg) showToast(successMsg, "success");
+    return data;
   };
 
   const changeItemQty = async (order, item, newQty) => {
-    if (newQty < 1) return deleteOrderItem(order, item);
-    const delta = newQty - item.quantity; // +ve = more sold, restore -delta to stock
-    await adjustStock(item.product_name, -delta);
-    await supabase.from("order_items").update({ quantity: newQty }).eq("id", item.id);
-    await recalcAndReload(order.id);
-    await loadProducts();
+    await runOrderRpc("update_order_item", { p_order_item_id: item.id, p_new_qty: Math.max(0, newQty) });
   };
 
   const deleteOrderItem = async (order, item) => {
-    await adjustStock(item.product_name, item.quantity); // return all units to stock
-    await supabase.from("order_items").delete().eq("id", item.id);
-    await recalcAndReload(order.id);
-    await loadProducts();
-    showToast("Item removed", "info");
+    await runOrderRpc("update_order_item", { p_order_item_id: item.id, p_new_qty: 0 }, "Item removed");
   };
 
   const addItemToOrder = async (order, product) => {
-    const existing = order.order_items?.find((i) => i.product_name.toLowerCase() === product.name.toLowerCase());
-    if (existing) {
-      await supabase.from("order_items").update({ quantity: existing.quantity + 1 }).eq("id", existing.id);
-    } else {
-      await supabase.from("order_items").insert({ order_id: order.id, product_name: product.name, quantity: 1, price: product.price });
-    }
-    await adjustStock(product.name, -1);
-    await recalcAndReload(order.id);
-    await loadProducts();
-    showToast(`${product.name} added`, "success");
+    await runOrderRpc("add_order_item", { p_order_id: order.id, p_product_id: product.id, p_qty: 1 }, `${product.name} added`);
   };
 
   const updateOrderStatus = async (orderId, status) => {
-    await supabase.from("orders").update({ status }).eq("id", orderId);
-    await loadOrders();
-    setSelectedOrder((prev) => prev ? { ...prev, status } : null);
+    const updated = await runOrderRpc("set_order_status", { p_order_id: orderId, p_status: status });
+    if (updated) setSelectedOrder((prev) => (prev ? { ...prev, status: updated.status } : null));
   };
 
   const handleReturn = async (order) => {
-    await supabase.from("orders").update({ status: "Cancelled" }).eq("id", order.id);
-    for (const item of order.order_items) {
-      const { data: product } = await supabase.from("products").select("stock, name").eq("business_id", businessId).ilike("name", item.product_name).maybeSingle();
-      if (product) await supabase.from("products").update({ stock: product.stock + item.quantity }).eq("business_id", businessId).ilike("name", item.product_name);
-    }
-    await loadOrders();
+    await runOrderRpc("set_order_status", { p_order_id: order.id, p_status: "Cancelled" });
     setSelectedOrder(null);
   };
 
@@ -120,6 +96,9 @@ export default function Orders({ businessId, business, role = "admin" }) {
       customer: order.customer || "Walk-in",
       payment: order.payment || "Cash",
       items: (order.order_items || []).map((i) => ({ name: i.product_name, qty: i.quantity, price: i.price })),
+      subtotal: order.subtotal,
+      discount: order.discount,
+      tax: order.tax,
       total: order.total,
     });
   };
@@ -146,7 +125,30 @@ export default function Orders({ businessId, business, role = "admin" }) {
     const businessName = business?.business_name || "DPOS";
     const now = new Date().toLocaleDateString("en-PK", { day: "2-digit", month: "short", year: "numeric" });
 
-    doc.setFillColor(21, 101, 192);
+    // DPOS dark theme — matches the app: near-black page, brand-blue accents,
+    // light text. Every page (including ones autoTable adds for pagination)
+    // gets the dark fill first, before any content is drawn on it.
+    const PAGE_BG = [5, 19, 40];       // ink-900
+    const PANEL_BG = [15, 30, 59];     // ink-800 (alternating rows)
+    const BORDER = [42, 58, 90];       // ink-700-ish, visible on dark
+    const TEXT_LIGHT = [226, 232, 240];
+    const TEXT_MUTED = [148, 163, 184];
+    const BRAND = [21, 101, 192];
+    const BRAND_LIGHT = [92, 196, 255];
+
+    const paintPageBg = () => {
+      doc.setFillColor(...PAGE_BG);
+      doc.rect(0, 0, 210, 297, "F");
+    };
+    const nativeAddPage = doc.addPage.bind(doc);
+    doc.addPage = (...args) => {
+      nativeAddPage(...args);
+      paintPageBg();
+      return doc;
+    };
+    paintPageBg();
+
+    doc.setFillColor(...BRAND);
     doc.rect(0, 0, 210, 35, "F");
     doc.setTextColor(255, 255, 255);
     doc.setFontSize(20);
@@ -159,30 +161,41 @@ export default function Orders({ businessId, business, role = "admin" }) {
 
     const completed = filtered.filter(o => (o.status || "Completed") === "Completed");
     const totalRevenue = completed.reduce((s, o) => s + Number(o.total), 0);
-    doc.setTextColor(0, 0, 0);
+    const totalDiscount = completed.reduce((s, o) => s + Number(o.discount || 0), 0);
+    const totalTax = completed.reduce((s, o) => s + Number(o.tax || 0), 0);
+    doc.setTextColor(...TEXT_LIGHT);
     doc.setFontSize(11);
     doc.setFont("helvetica", "bold");
     doc.text("Summary", 14, 48);
     doc.setFont("helvetica", "normal");
     doc.setFontSize(10);
+    doc.setTextColor(...TEXT_MUTED);
     doc.text(`Total Orders: ${filtered.length}`, 14, 56);
     doc.text(`Completed: ${completed.length}`, 80, 56);
+    doc.text(`Discount Given: Rs. ${totalDiscount.toLocaleString()}`, 130, 56);
+    doc.setTextColor(...BRAND_LIGHT);
     doc.text(`Total Revenue: Rs. ${totalRevenue.toLocaleString()}`, 14, 63);
+    doc.setTextColor(...TEXT_MUTED);
+    doc.text(`Tax Collected: Rs. ${totalTax.toLocaleString()}`, 80, 63);
 
     autoTable(doc, {
       startY: 72,
-      head: [["Order ID", "Date & Time", "Items", "Total", "Status"]],
+      head: [["Order ID", "Date & Time", "Customer", "Payment", "Discount", "Tax", "Total", "Status"]],
       body: filtered.map(o => [
         o.receipt_no,
         new Date(o.created_at).toLocaleDateString("en-PK", { day: "2-digit", month: "short", year: "numeric" }) + " " +
         new Date(o.created_at).toLocaleTimeString("en-PK", { hour: "2-digit", minute: "2-digit" }),
-        `${o.order_items?.length || 0} item(s)`,
+        o.customer || "Walk-in",
+        o.payment || "Cash",
+        Number(o.discount) > 0 ? `Rs. ${Number(o.discount).toLocaleString()}` : "-",
+        Number(o.tax) > 0 ? `Rs. ${Number(o.tax).toLocaleString()}` : "-",
         `Rs. ${Number(o.total).toLocaleString()}`,
         o.status || "Completed",
       ]),
-      headStyles: { fillColor: [21, 101, 192], textColor: 255, fontStyle: "bold" },
-      alternateRowStyles: { fillColor: [245, 247, 255] },
-      styles: { fontSize: 9, cellPadding: 4 },
+      headStyles: { fillColor: BRAND, textColor: 255, fontStyle: "bold" },
+      bodyStyles: { fillColor: PAGE_BG, textColor: TEXT_LIGHT, lineColor: BORDER },
+      alternateRowStyles: { fillColor: PANEL_BG },
+      styles: { fontSize: 9, cellPadding: 4, lineColor: BORDER, lineWidth: 0.1 },
     });
 
     const dailySales = {};
@@ -198,6 +211,7 @@ export default function Orders({ businessId, business, role = "admin" }) {
     const finalY = doc.lastAutoTable.finalY + 15;
     doc.setFontSize(11);
     doc.setFont("helvetica", "bold");
+    doc.setTextColor(...TEXT_LIGHT);
     doc.text("Daily Sales Summary", 14, finalY);
 
     autoTable(doc, {
@@ -208,16 +222,17 @@ export default function Orders({ businessId, business, role = "admin" }) {
         data.orders,
         `Rs. ${data.revenue.toLocaleString()}`,
       ]),
-      headStyles: { fillColor: [21, 101, 192], textColor: 255, fontStyle: "bold" },
-      alternateRowStyles: { fillColor: [245, 247, 255] },
-      styles: { fontSize: 9, cellPadding: 4 },
+      headStyles: { fillColor: BRAND, textColor: 255, fontStyle: "bold" },
+      bodyStyles: { fillColor: PAGE_BG, textColor: TEXT_LIGHT, lineColor: BORDER },
+      alternateRowStyles: { fillColor: PANEL_BG },
+      styles: { fontSize: 9, cellPadding: 4, lineColor: BORDER, lineWidth: 0.1 },
     });
 
     const pageCount = doc.internal.getNumberOfPages();
     for (let i = 1; i <= pageCount; i++) {
       doc.setPage(i);
       doc.setFontSize(8);
-      doc.setTextColor(150);
+      doc.setTextColor(...TEXT_MUTED);
       doc.text(`Page ${i} of ${pageCount} — Powered by DPOS`, 14, 290);
     }
 
@@ -240,71 +255,68 @@ export default function Orders({ businessId, business, role = "admin" }) {
   };
 
   return (
-    <div className="p-4 md:p-6 bg-[#f4f7ff] min-h-screen pb-24 md:pb-6">
+    <div className="p-4 md:p-6 bg-ink-50 dark:bg-ink-900 min-h-screen pb-24 md:pb-6">
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h2 className="text-2xl font-extrabold text-gray-800 tracking-tight">Orders</h2>
-          <p className="text-gray-400 text-xs mt-0.5">All transactions and order history</p>
+          <h2 className="text-2xl font-extrabold text-ink-900 dark:text-white tracking-tight">Orders</h2>
+          <p className="text-ink-600 dark:text-ink-400 text-xs mt-0.5">All transactions and order history</p>
         </div>
         <button
           onClick={exportOrdersPDF}
-          className="flex items-center gap-2 px-4 py-2.5 text-white text-sm font-bold rounded-2xl shadow-md hover:opacity-90 transition active:scale-95"
-          style={{ background: `linear-gradient(90deg, ${themeColor}, ${themeColor}cc)` }}
+          className="flex items-center gap-2 px-4 py-2.5 text-white text-sm font-bold rounded-2xl shadow-elevated hover:brightness-110 transition-all active:scale-95 bg-gradient-to-r from-brand-600 to-brand-700"
         >
           <Download size={15} /> Export PDF
         </button>
       </div>
 
       <div className="flex gap-2 mb-4">
-        <div className="flex items-center bg-white rounded-2xl px-3 py-2.5 gap-2 border border-gray-100 shadow-sm flex-1">
-          <Search size={14} className="text-gray-400 flex-shrink-0" />
-          <input type="text" placeholder="Search order ID..." value={search} onChange={(e) => setSearch(e.target.value)} className="bg-transparent text-sm outline-none text-gray-700 w-full" />
+        <div className="flex items-center bg-white dark:bg-ink-800 rounded-2xl px-3 py-2.5 gap-2 border border-black/10 dark:border-white/10 flex-1 focus-within:ring-2 focus-within:ring-brand-500/30 focus-within:border-brand-500/40 transition-all">
+          <Search size={14} className="text-ink-600 dark:text-ink-400 flex-shrink-0" />
+          <input type="text" placeholder="Search order ID..." value={search} onChange={(e) => setSearch(e.target.value)} className="bg-transparent text-sm outline-none text-ink-900 dark:text-white placeholder:text-ink-500 w-full" />
         </div>
-        <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="bg-white border border-gray-100 shadow-sm rounded-2xl px-3 py-2.5 text-sm text-gray-600 outline-none">
+        <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="bg-white dark:bg-ink-800 border border-black/10 dark:border-white/10 rounded-2xl px-3 py-2.5 text-sm text-ink-700 dark:text-ink-200 outline-none">
           {["All", "Completed", "Pending", "Cancelled"].map((s) => <option key={s}>{s}</option>)}
         </select>
       </div>
 
       <div className="flex gap-2 mb-5">
         {["All", "Today", "Week"].map((d) => (
-          <button key={d} onClick={() => setFilterDate(d)} className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${filterDate === d ? "text-white shadow-md" : "bg-white text-gray-500 border border-gray-100"}`} style={filterDate === d ? { background: `linear-gradient(90deg, ${themeColor}, ${themeColor}cc)` } : {}}>
+          <button key={d} onClick={() => setFilterDate(d)} className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${filterDate === d ? "text-white shadow-elevated bg-gradient-to-r from-brand-600 to-brand-700" : "bg-white dark:bg-ink-800 text-ink-600 dark:text-ink-300 border border-black/10 dark:border-white/10 hover:border-brand-500/40"}`}>
             {d}
           </button>
         ))}
       </div>
 
-      <div className="hidden md:block bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+      <div className="hidden md:block bg-white dark:bg-ink-800 rounded-3xl shadow-soft border border-black/10 dark:border-white/10 overflow-hidden">
         <table className="w-full text-sm">
           <thead>
-            <tr style={{ background: `linear-gradient(90deg, ${themeColor}, ${themeColor}cc)` }}>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Order ID</th>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Date & Time</th>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Items</th>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Total</th>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Status</th>
-              <th className="text-left px-5 py-3.5 text-white font-semibold">Actions</th>
+            <tr className="bg-gradient-to-r from-brand-600 to-brand-700">
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Order ID</th>
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Date & Time</th>
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Items</th>
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Total</th>
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Status</th>
+              <th className="text-left px-5 py-3.5 text-ink-900 dark:text-white font-semibold">Actions</th>
             </tr>
           </thead>
           <tbody>
             {filtered.map((order, i) => (
-              <tr key={order.id} className={`border-t border-gray-50 transition cursor-pointer ${i % 2 === 0 ? "bg-white" : "bg-gray-50/50"}`}
+              <tr key={order.id} className={`border-t border-black/10 dark:border-white/10 transition-colors cursor-pointer hover:bg-brand-500/10 ${i % 2 === 0 ? "bg-white dark:bg-ink-800" : "bg-white dark:bg-ink-800/60"}`}
                 onClick={() => setSelectedOrder(order)}
-                onMouseEnter={e => e.currentTarget.style.background = `${themeColor}08`}
-                onMouseLeave={e => e.currentTarget.style.background = i % 2 === 0 ? "#fff" : "#f9fafb"}
               >
-                <td className="px-5 py-3.5 font-bold text-gray-700">{order.receipt_no}</td>
-                <td className="px-5 py-3.5 text-gray-500">
+                <td className="px-5 py-3.5 font-bold text-ink-900 dark:text-white">{order.receipt_no}</td>
+                <td className="px-5 py-3.5 text-ink-600 dark:text-ink-300">
                   {new Date(order.created_at).toLocaleDateString("en-PK", { day: "2-digit", month: "short", year: "numeric" })} {new Date(order.created_at).toLocaleTimeString("en-PK", { hour: "2-digit", minute: "2-digit" })}
                 </td>
-                <td className="px-5 py-3.5 text-gray-500">{order.order_items?.length || 0} item(s)</td>
-                <td className="px-5 py-3.5 font-bold" style={{ color: themeColor }}>Rs. {order.total}</td>
+                <td className="px-5 py-3.5 text-ink-600 dark:text-ink-300">{order.order_items?.length || 0} item(s)</td>
+                <td className="px-5 py-3.5 font-bold text-brand-600 dark:text-brand-300">Rs. {order.total}</td>
                 <td className="px-5 py-3.5">
                   <span className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${statusStyles[order.status || "Completed"]}`}>
                     {statusIcons[order.status || "Completed"]} {order.status || "Completed"}
                   </span>
                 </td>
                 <td className="px-5 py-3.5" onClick={(e) => e.stopPropagation()}>
-                  <button onClick={() => { setSelectedOrder(order); setShowInvoice(true); }} className="px-3 py-1.5 text-xs font-bold rounded-lg border transition hover:opacity-80" style={{ background: `${themeColor}10`, color: themeColor, borderColor: `${themeColor}20` }}>
+                  <button onClick={() => { setSelectedOrder(order); setShowInvoice(true); }} className="px-3 py-1.5 text-xs font-bold rounded-lg border border-brand-500/30 bg-brand-500/10 text-brand-600 dark:text-brand-300 transition-colors hover:bg-brand-500/20">
                     Invoice
                   </button>
                 </td>
@@ -312,54 +324,54 @@ export default function Orders({ businessId, business, role = "admin" }) {
             ))}
           </tbody>
         </table>
-        {filtered.length === 0 && <div className="text-center py-16"><p className="text-sm font-semibold text-gray-400">No orders found</p></div>}
+        {filtered.length === 0 && <div className="text-center py-16"><p className="text-sm font-semibold text-ink-600 dark:text-ink-400">No orders found</p></div>}
       </div>
 
       <div className="md:hidden space-y-3">
-        {filtered.map((order) => (
-          <div key={order.id} className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex items-center gap-3 cursor-pointer active:scale-95 transition-all" onClick={() => setSelectedOrder(order)}>
+        {filtered.map((order, i) => (
+          <div key={order.id} className="bg-white dark:bg-ink-800 rounded-2xl shadow-soft border border-black/10 dark:border-white/10 p-4 flex items-center gap-3 cursor-pointer active:scale-95 transition-all animate-fade-up" style={{ animationDelay: `${Math.min(i, 10) * 0.03}s` }} onClick={() => setSelectedOrder(order)}>
             <div className="flex-1 min-w-0">
               <div className="flex items-center justify-between mb-1">
-                <p className="font-bold text-gray-800 text-sm">{order.receipt_no}</p>
+                <p className="font-bold text-ink-900 dark:text-white text-sm">{order.receipt_no}</p>
                 <span className={`px-2 py-0.5 rounded-lg text-xs font-bold border ${statusStyles[order.status || "Completed"]}`}>{order.status || "Completed"}</span>
               </div>
-              <p className="text-xs text-gray-400 mb-1">
+              <p className="text-xs text-ink-600 dark:text-ink-400 mb-1">
                 {new Date(order.created_at).toLocaleDateString("en-PK", { day: "2-digit", month: "short", year: "numeric" })} · {new Date(order.created_at).toLocaleTimeString("en-PK", { hour: "2-digit", minute: "2-digit" })}
               </p>
               <div className="flex items-center justify-between">
-                <p className="text-xs text-gray-400">{order.order_items?.length || 0} item(s)</p>
-                <p className="font-extrabold text-sm" style={{ color: themeColor }}>Rs. {order.total}</p>
+                <p className="text-xs text-ink-600 dark:text-ink-400">{order.order_items?.length || 0} item(s)</p>
+                <p className="font-extrabold text-sm text-brand-600 dark:text-brand-300">Rs. {order.total}</p>
               </div>
             </div>
-            <ChevronRight size={16} className="text-gray-300 flex-shrink-0" />
+            <ChevronRight size={16} className="text-ink-500 flex-shrink-0" />
           </div>
         ))}
-        {filtered.length === 0 && <div className="text-center py-16"><p className="text-sm font-semibold text-gray-400">No orders found</p></div>}
+        {filtered.length === 0 && <div className="text-center py-16"><p className="text-sm font-semibold text-ink-600 dark:text-ink-400">No orders found</p></div>}
       </div>
 
       {selectedOrder && !showInvoice && (
-        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-50 p-0 md:p-4">
-          <div className="bg-white rounded-t-3xl md:rounded-2xl shadow-2xl w-full md:max-w-md max-h-[90vh] flex flex-col">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-50 p-0 md:p-4 animate-fade-in">
+          <div className="bg-white dark:bg-ink-800 rounded-t-3xl md:rounded-3xl shadow-2xl w-full md:max-w-md max-h-[90vh] flex flex-col animate-fade-up border border-black/10 dark:border-white/10">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-black/10 dark:border-white/10">
               <div>
-                <h3 className="font-extrabold text-gray-800">{selectedOrder.receipt_no}</h3>
-                <p className="text-xs text-gray-400">{new Date(selectedOrder.created_at).toLocaleDateString("en-PK")} · {new Date(selectedOrder.created_at).toLocaleTimeString("en-PK", { hour: "2-digit", minute: "2-digit" })}</p>
+                <h3 className="font-extrabold text-ink-900 dark:text-white">{selectedOrder.receipt_no}</h3>
+                <p className="text-xs text-ink-600 dark:text-ink-400">{new Date(selectedOrder.created_at).toLocaleDateString("en-PK")} · {new Date(selectedOrder.created_at).toLocaleTimeString("en-PK", { hour: "2-digit", minute: "2-digit" })}</p>
               </div>
-              <button onClick={() => setSelectedOrder(null)} className="w-8 h-8 rounded-xl bg-gray-100 flex items-center justify-center"><X size={16} className="text-gray-500" /></button>
+              <button onClick={() => setSelectedOrder(null)} className="w-8 h-8 rounded-xl bg-black/5 dark:bg-white/5 flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors"><X size={16} className="text-ink-600 dark:text-ink-300" /></button>
             </div>
             <div className="p-5 overflow-auto flex-1 space-y-4">
               <div className="grid grid-cols-2 gap-3">
-                <div className="bg-gray-50 rounded-2xl p-3"><p className="text-xs text-gray-400">Customer</p><p className="font-semibold text-sm text-gray-700">{selectedOrder.customer || "Walk-in"}</p></div>
-                <div className="bg-gray-50 rounded-2xl p-3"><p className="text-xs text-gray-400">Payment</p><p className="font-semibold text-sm text-gray-700">{selectedOrder.payment || "Cash"}</p></div>
-                <div className="bg-gray-50 rounded-2xl p-3"><p className="text-xs text-gray-400">Status</p><p className="font-bold text-sm">{statusIcons[selectedOrder.status || "Completed"]} {selectedOrder.status || "Completed"}</p></div>
-                <div className="bg-gray-50 rounded-2xl p-3"><p className="text-xs text-gray-400">Total</p><p className="font-bold text-sm" style={{ color: themeColor }}>Rs. {selectedOrder.total}</p></div>
+                <div className="bg-ink-100 dark:bg-ink-700 rounded-2xl p-3"><p className="text-xs text-ink-600 dark:text-ink-400">Customer</p><p className="font-semibold text-sm text-ink-800 dark:text-ink-100">{selectedOrder.customer || "Walk-in"}</p></div>
+                <div className="bg-ink-100 dark:bg-ink-700 rounded-2xl p-3"><p className="text-xs text-ink-600 dark:text-ink-400">Payment</p><p className="font-semibold text-sm text-ink-800 dark:text-ink-100">{selectedOrder.payment || "Cash"}</p></div>
+                <div className="bg-ink-100 dark:bg-ink-700 rounded-2xl p-3"><p className="text-xs text-ink-600 dark:text-ink-400">Status</p><p className="font-bold text-sm text-ink-900 dark:text-white">{statusIcons[selectedOrder.status || "Completed"]} {selectedOrder.status || "Completed"}</p></div>
+                <div className="bg-ink-100 dark:bg-ink-700 rounded-2xl p-3"><p className="text-xs text-ink-600 dark:text-ink-400">Total</p><p className="font-bold text-sm text-brand-600 dark:text-brand-300">Rs. {selectedOrder.total}</p></div>
               </div>
               {isAdmin && (
                 <div>
-                  <p className="text-xs font-bold text-gray-400 mb-2 uppercase tracking-wider">Change Status</p>
+                  <p className="text-xs font-bold text-ink-600 dark:text-ink-400 mb-2 uppercase tracking-wider">Change Status</p>
                   <div className="flex gap-2">
                     {["Completed", "Pending", "Cancelled"].map((s) => (
-                      <button key={s} onClick={() => updateOrderStatus(selectedOrder.id, s)} className={`flex-1 py-2 rounded-xl text-xs font-bold border transition ${(selectedOrder.status || "Completed") === s ? statusStyles[s] : "bg-gray-50 text-gray-400 border-gray-100"}`}>
+                      <button key={s} onClick={() => updateOrderStatus(selectedOrder.id, s)} className={`flex-1 py-2 rounded-xl text-xs font-bold border transition-colors ${(selectedOrder.status || "Completed") === s ? statusStyles[s] : "bg-ink-100 dark:bg-ink-700 text-ink-600 dark:text-ink-400 border-black/10 dark:border-white/10 hover:bg-ink-200 dark:hover:bg-ink-600"}`}>
                         {statusIcons[s]} {s}
                       </button>
                     ))}
@@ -368,9 +380,9 @@ export default function Orders({ businessId, business, role = "admin" }) {
               )}
               <div>
                 <div className="flex items-center justify-between mb-2">
-                  <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Items</p>
+                  <p className="text-xs font-bold text-ink-600 dark:text-ink-400 uppercase tracking-wider">Items</p>
                   {isAdmin && (selectedOrder.status || "Completed") !== "Cancelled" && (
-                    <button onClick={() => { setShowAddItem(true); setProductSearch(""); }} className="flex items-center gap-1 text-xs font-bold px-2.5 py-1 rounded-lg border transition hover:opacity-80" style={{ background: `${themeColor}10`, color: themeColor, borderColor: `${themeColor}20` }}>
+                    <button onClick={() => { setShowAddItem(true); setProductSearch(""); }} className="flex items-center gap-1 text-xs font-bold px-2.5 py-1 rounded-lg border border-brand-500/30 bg-brand-500/10 text-brand-600 dark:text-brand-300 transition-colors hover:bg-brand-500/20">
                       <Plus size={13} /> Add Item
                     </button>
                   )}
@@ -379,46 +391,61 @@ export default function Orders({ businessId, business, role = "admin" }) {
                   {selectedOrder.order_items?.map((item) => {
                     const editable = isAdmin && (selectedOrder.status || "Completed") !== "Cancelled";
                     return (
-                      <div key={item.id} className="flex justify-between items-center gap-2 rounded-2xl px-4 py-3 border" style={{ background: `${themeColor}08`, borderColor: `${themeColor}20` }}>
+                      <div key={item.id} className="flex justify-between items-center gap-2 rounded-2xl px-4 py-3 border border-brand-500/20 bg-brand-500/10">
                         <div className="min-w-0 flex-1">
-                          <p className="font-semibold text-sm text-gray-800 truncate">{item.product_name}</p>
-                          <p className="text-xs text-gray-400">Rs. {item.price} each · Rs. {item.price * item.quantity}</p>
+                          <p className="font-semibold text-sm text-ink-900 dark:text-white truncate">{item.product_name}</p>
+                          <p className="text-xs text-ink-600 dark:text-ink-400">Rs. {item.price} each · Rs. {item.price * item.quantity}</p>
                         </div>
                         {editable ? (
                           <div className="flex items-center gap-1 flex-shrink-0">
-                            <button onClick={() => changeItemQty(selectedOrder, item, item.quantity - 1)} className="w-7 h-7 bg-white rounded-lg shadow-sm flex items-center justify-center border" style={{ color: themeColor, borderColor: `${themeColor}30` }}>
+                            <button onClick={() => changeItemQty(selectedOrder, item, item.quantity - 1)} className="w-9 h-9 bg-ink-100 dark:bg-ink-700 rounded-lg flex items-center justify-center border border-brand-500/30 text-brand-600 dark:text-brand-300 hover:bg-ink-200 dark:hover:bg-ink-600 transition">
                               <Minus size={12} />
                             </button>
-                            <span className="w-6 text-center text-sm font-bold text-gray-700">{item.quantity}</span>
-                            <button onClick={() => changeItemQty(selectedOrder, item, item.quantity + 1)} className="w-7 h-7 bg-white rounded-lg shadow-sm flex items-center justify-center border" style={{ color: themeColor, borderColor: `${themeColor}30` }}>
+                            <span className="w-6 text-center text-sm font-bold text-ink-900 dark:text-white">{item.quantity}</span>
+                            <button onClick={() => changeItemQty(selectedOrder, item, item.quantity + 1)} className="w-9 h-9 bg-ink-100 dark:bg-ink-700 rounded-lg flex items-center justify-center border border-brand-500/30 text-brand-600 dark:text-brand-300 hover:bg-ink-200 dark:hover:bg-ink-600 transition">
                               <Plus size={12} />
                             </button>
-                            <button onClick={() => deleteOrderItem(selectedOrder, item)} className="w-7 h-7 bg-red-50 text-red-400 rounded-lg flex items-center justify-center border border-red-100 ml-1">
+                            <button onClick={() => deleteOrderItem(selectedOrder, item)} className="w-9 h-9 bg-red-500/10 text-red-600 dark:text-red-400 rounded-lg flex items-center justify-center border border-red-500/20 ml-1 hover:bg-red-500/20 transition-colors">
                               <Trash2 size={12} />
                             </button>
                           </div>
                         ) : (
-                          <p className="font-bold text-sm flex-shrink-0" style={{ color: themeColor }}>x{item.quantity}</p>
+                          <p className="font-bold text-sm flex-shrink-0 text-brand-600 dark:text-brand-300">x{item.quantity}</p>
                         )}
                       </div>
                     );
                   })}
                   {selectedOrder.order_items?.length === 0 && (
-                    <p className="text-center text-xs text-gray-400 py-3">No items in this order</p>
+                    <p className="text-center text-xs text-ink-600 dark:text-ink-400 py-3">No items in this order</p>
                   )}
                 </div>
               </div>
-              <div className="flex justify-between font-extrabold text-base pt-2 border-t border-gray-100" style={{ color: themeColor }}>
-                <span>Total</span><span>Rs. {selectedOrder.total}</span>
+              <div className="pt-2 border-t border-black/10 dark:border-white/10 space-y-1">
+                <div className="flex justify-between text-xs text-ink-600 dark:text-ink-400">
+                  <span>Subtotal</span><span>Rs. {selectedOrder.subtotal ?? selectedOrder.total}</span>
+                </div>
+                {Number(selectedOrder.discount) > 0 && (
+                  <div className="flex justify-between text-xs text-red-600 dark:text-red-400">
+                    <span>Discount</span><span>-Rs. {selectedOrder.discount}</span>
+                  </div>
+                )}
+                {Number(selectedOrder.tax) > 0 && (
+                  <div className="flex justify-between text-xs text-ink-600 dark:text-ink-400">
+                    <span>Tax</span><span>Rs. {selectedOrder.tax}</span>
+                  </div>
+                )}
+                <div className="flex justify-between font-extrabold text-base text-brand-600 dark:text-brand-300">
+                  <span>Total</span><span>Rs. {selectedOrder.total}</span>
+                </div>
               </div>
             </div>
-            <div className="flex gap-3 p-4 border-t border-gray-100">
+            <div className="flex gap-3 p-4 border-t border-black/10 dark:border-white/10">
               {isAdmin && (
-                <button onClick={() => handleReturn(selectedOrder)} className="flex-1 py-3 rounded-2xl bg-red-50 text-red-400 border border-red-100 font-bold text-sm flex items-center justify-center gap-2">
+                <button onClick={() => handleReturn(selectedOrder)} className="flex-1 py-3 rounded-2xl bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20 font-bold text-sm flex items-center justify-center gap-2 hover:bg-red-500/20 transition-colors">
                   <RotateCcw size={14} /> Return
                 </button>
               )}
-              <button onClick={() => setShowInvoice(true)} className="flex-1 py-3 rounded-2xl text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md" style={{ background: `linear-gradient(90deg, ${themeColor}, ${themeColor}cc)` }}>
+              <button onClick={() => setShowInvoice(true)} className="flex-1 py-3 rounded-2xl text-white font-bold text-sm flex items-center justify-center gap-2 shadow-elevated hover:brightness-110 transition-all bg-gradient-to-r from-brand-600 to-brand-700">
                 <Printer size={14} /> Invoice
               </button>
             </div>
@@ -427,35 +454,35 @@ export default function Orders({ businessId, business, role = "admin" }) {
       )}
 
       {showAddItem && selectedOrder && (
-        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-[60] p-0 md:p-4">
-          <div className="bg-white rounded-t-3xl md:rounded-2xl shadow-2xl w-full md:max-w-md max-h-[80vh] flex flex-col">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-              <h3 className="font-extrabold text-gray-800">Add Item</h3>
-              <button onClick={() => setShowAddItem(false)} className="w-8 h-8 rounded-xl bg-gray-100 flex items-center justify-center"><X size={16} className="text-gray-500" /></button>
+        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-[60] p-0 md:p-4 animate-fade-in">
+          <div className="bg-white dark:bg-ink-800 rounded-t-3xl md:rounded-3xl shadow-2xl w-full md:max-w-md max-h-[80vh] flex flex-col animate-fade-up border border-black/10 dark:border-white/10">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-black/10 dark:border-white/10">
+              <h3 className="font-extrabold text-ink-900 dark:text-white">Add Item</h3>
+              <button onClick={() => setShowAddItem(false)} className="w-8 h-8 rounded-xl bg-black/5 dark:bg-white/5 flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors"><X size={16} className="text-ink-600 dark:text-ink-300" /></button>
             </div>
-            <div className="p-4 border-b border-gray-100">
-              <div className="flex items-center bg-gray-100 rounded-2xl px-3 py-2.5 gap-2">
-                <Search size={14} className="text-gray-400 flex-shrink-0" />
-                <input type="text" placeholder="Search products..." value={productSearch} onChange={(e) => setProductSearch(e.target.value)} className="bg-transparent text-sm outline-none text-gray-700 w-full" />
+            <div className="p-4 border-b border-black/10 dark:border-white/10">
+              <div className="flex items-center bg-ink-100 dark:bg-ink-700 rounded-2xl px-3 py-2.5 gap-2 focus-within:ring-2 focus-within:ring-brand-500/30 transition-all">
+                <Search size={14} className="text-ink-600 dark:text-ink-400 flex-shrink-0" />
+                <input type="text" placeholder="Search products..." value={productSearch} onChange={(e) => setProductSearch(e.target.value)} className="bg-transparent text-sm outline-none text-ink-900 dark:text-white placeholder:text-ink-500 w-full" />
               </div>
             </div>
             <div className="p-4 overflow-auto flex-1 space-y-2">
               {products.filter((p) => p.name.toLowerCase().includes(productSearch.toLowerCase())).map((product) => (
-                <button key={product.id} onClick={() => addItemToOrder(selectedOrder, product)} className="w-full flex items-center justify-between gap-3 rounded-2xl px-4 py-3 border text-left transition hover:opacity-80" style={{ background: `${themeColor}08`, borderColor: `${themeColor}20` }}>
+                <button key={product.id} onClick={() => addItemToOrder(selectedOrder, product)} className="w-full flex items-center justify-between gap-3 rounded-2xl px-4 py-3 border border-brand-500/20 bg-brand-500/10 text-left transition-colors hover:bg-brand-500/20">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-xl overflow-hidden bg-white flex items-center justify-center flex-shrink-0 border" style={{ borderColor: `${themeColor}20` }}>
+                    <div className="w-9 h-9 rounded-xl overflow-hidden bg-white flex items-center justify-center flex-shrink-0 border border-brand-500/20">
                       {product.image_url ? <img src={product.image_url} className="w-full h-full object-contain p-1" /> : <span className="text-xl">{product.emoji || "📦"}</span>}
                     </div>
                     <div className="min-w-0">
-                      <p className="font-semibold text-sm text-gray-800 truncate">{product.name}</p>
-                      <p className="text-xs text-gray-400">Rs. {product.price}{product.stock != null ? ` · ${product.stock} in stock` : ""}</p>
+                      <p className="font-semibold text-sm text-ink-900 dark:text-white truncate">{product.name}</p>
+                      <p className="text-xs text-ink-600 dark:text-ink-400">Rs. {product.price}{product.stock != null ? ` · ${product.stock} in stock` : ""}</p>
                     </div>
                   </div>
-                  <Plus size={16} style={{ color: themeColor }} className="flex-shrink-0" />
+                  <Plus size={16} className="flex-shrink-0 text-brand-600 dark:text-brand-300" />
                 </button>
               ))}
               {products.filter((p) => p.name.toLowerCase().includes(productSearch.toLowerCase())).length === 0 && (
-                <p className="text-center text-sm text-gray-400 py-10">No products found</p>
+                <p className="text-center text-sm text-ink-600 dark:text-ink-400 py-10">No products found</p>
               )}
             </div>
           </div>
@@ -463,15 +490,16 @@ export default function Orders({ businessId, business, role = "admin" }) {
       )}
 
       {showInvoice && selectedOrder && (
-        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-50 p-0 md:p-4">
-          <div className="bg-white rounded-t-3xl md:rounded-2xl shadow-2xl w-full md:max-w-sm flex flex-col">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-              <h3 className="font-extrabold text-gray-800">Invoice</h3>
-              <button onClick={() => { setShowInvoice(false); setSelectedOrder(null); }} className="w-8 h-8 rounded-xl bg-gray-100 flex items-center justify-center">
-                <X size={16} className="text-gray-500" />
+        <div className="fixed inset-0 bg-black/50 flex items-end md:items-center justify-center z-50 p-0 md:p-4 animate-fade-in">
+          <div className="bg-white dark:bg-ink-800 rounded-t-3xl md:rounded-3xl shadow-2xl w-full md:max-w-sm flex flex-col animate-fade-up border border-black/10 dark:border-white/10">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-black/10 dark:border-white/10">
+              <h3 className="font-extrabold text-ink-900 dark:text-white">Invoice</h3>
+              <button onClick={() => { setShowInvoice(false); setSelectedOrder(null); }} className="w-8 h-8 rounded-xl bg-black/5 dark:bg-white/5 flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors">
+                <X size={16} className="text-ink-600 dark:text-ink-300" />
               </button>
             </div>
-            <div className="p-5 overflow-auto max-h-[60vh]">
+            <div className="p-5 overflow-auto max-h-[60vh] bg-ink-50 dark:bg-ink-900/60">
+              <div className="bg-white rounded-2xl p-2 shadow-inner">
               <div style={{ fontFamily: "'Courier New', monospace", fontSize: "12px", color: "#000", width: "100%", padding: "8px" }}>
                 <div style={{ textAlign: "center", marginBottom: "12px" }}>
                   <h1 style={{ fontSize: "16px", fontWeight: "bold", letterSpacing: "1px", margin: 0 }}>{business?.business_name || "DPOS"}</h1>
@@ -504,6 +532,13 @@ export default function Orders({ businessId, business, role = "admin" }) {
                 <div style={{ borderTop: "1px dashed #999", margin: "8px 0" }} />
                 <table style={{ width: "100%", fontSize: "11px", tableLayout: "fixed" }}>
                   <tbody>
+                    <tr><td>Subtotal</td><td style={{ textAlign: "right" }}>Rs. {selectedOrder.subtotal ?? selectedOrder.total}</td></tr>
+                    {Number(selectedOrder.discount) > 0 && (
+                      <tr><td>Discount</td><td style={{ textAlign: "right" }}>-Rs. {selectedOrder.discount}</td></tr>
+                    )}
+                    {Number(selectedOrder.tax) > 0 && (
+                      <tr><td>Tax</td><td style={{ textAlign: "right" }}>Rs. {selectedOrder.tax}</td></tr>
+                    )}
                     <tr>
                       <td style={{ fontWeight: "bold", fontSize: "13px", paddingTop: "4px" }}>TOTAL</td>
                       <td style={{ textAlign: "right", fontWeight: "bold", fontSize: "13px", paddingTop: "4px" }}>Rs. {selectedOrder.total}</td>
@@ -516,10 +551,11 @@ export default function Orders({ businessId, business, role = "admin" }) {
                   <p style={{ marginTop: "4px" }}>Powered by Devorions</p>
                 </div>
               </div>
+              </div>
             </div>
-            <div className="flex gap-3 p-4 border-t border-gray-100">
-              <button onClick={() => { setShowInvoice(false); setSelectedOrder(null); }} className="flex-1 py-3 rounded-2xl border border-gray-200 text-gray-500 font-bold text-sm">Close</button>
-              <button onClick={() => handlePrint(selectedOrder)} className="flex-1 py-3 rounded-2xl text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md" style={{ background: `linear-gradient(90deg, ${themeColor}, ${themeColor}cc)` }}>
+            <div className="flex gap-3 p-4 border-t border-black/10 dark:border-white/10">
+              <button onClick={() => { setShowInvoice(false); setSelectedOrder(null); }} className="flex-1 py-3 rounded-2xl border border-black/10 dark:border-white/10 text-ink-600 dark:text-ink-300 font-bold text-sm hover:bg-black/5 dark:bg-white/5 transition-colors">Close</button>
+              <button onClick={() => handlePrint(selectedOrder)} className="flex-1 py-3 rounded-2xl text-white font-bold text-sm flex items-center justify-center gap-2 shadow-elevated hover:brightness-110 transition-all bg-gradient-to-r from-brand-600 to-brand-700">
                 <Printer size={15} /> Print
               </button>
             </div>

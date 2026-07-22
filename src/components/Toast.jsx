@@ -8,11 +8,13 @@ const icons = {
   info: <Info size={16} />,
 };
 
+// Border/text colors come from CSS vars (see index.css) so they flip with
+// the light/dark theme without needing JS to track theme state here.
 const colors = {
-  success: { bg: "#f0fdf4", border: "#bbf7d0", text: "#16a34a", icon: "#22c55e" },
-  error: { bg: "#fef2f2", border: "#fecaca", text: "#dc2626", icon: "#ef4444" },
-  warning: { bg: "#fffbeb", border: "#fde68a", text: "#d97706", icon: "#f59e0b" },
-  info: { bg: "#eff6ff", border: "#bfdbfe", text: "#1d4ed8", icon: "#3b82f6" },
+  success: { border: "var(--toast-success-border)", text: "var(--toast-success-text)", icon: "#22c55e" },
+  error: { border: "var(--toast-error-border)", text: "var(--toast-error-text)", icon: "#ef4444" },
+  warning: { border: "var(--toast-warning-border)", text: "var(--toast-warning-text)", icon: "#f59e0b" },
+  info: { border: "var(--toast-info-border)", text: "var(--toast-info-text)", icon: "#0091f0" },
 };
 
 let toastFn = null;
@@ -59,8 +61,8 @@ export default function Toast() {
           return (
             <div
               key={toast.id}
-              className="flex items-center gap-3 px-4 py-3 rounded-2xl shadow-lg border"
-              style={{ background: c.bg, borderColor: c.border }}
+              className="flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl border backdrop-blur-md animate-fade-up bg-white dark:bg-ink-800/95"
+              style={{ borderColor: c.border }}
             >
               <div
                 className="w-7 h-7 rounded-xl flex items-center justify-center flex-shrink-0"
@@ -76,27 +78,23 @@ export default function Toast() {
 
       {/* Confirm Modal */}
       {confirm && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-[200] p-6">
-          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-xs p-6">
-            <div
-              className="w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-4"
-              style={{ background: "#eff6ff" }}
-            >
-              <AlertTriangle size={24} color="#1565C0" />
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[200] p-6 animate-fade-in">
+          <div className="bg-white dark:bg-ink-800 rounded-3xl shadow-2xl w-full max-w-xs p-6 animate-scale-in border border-black/10 dark:border-white/10">
+            <div className="w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-4 bg-brand-500/10">
+              <AlertTriangle size={24} className="text-brand-600 dark:text-brand-300" />
             </div>
-            <h3 className="text-base font-extrabold text-gray-800 text-center mb-2">Are you sure?</h3>
-            <p className="text-sm text-gray-400 text-center mb-6">{confirm.message}</p>
+            <h3 className="text-base font-extrabold text-ink-900 dark:text-white text-center mb-2">Are you sure?</h3>
+            <p className="text-sm text-ink-600 dark:text-ink-400 text-center mb-6">{confirm.message}</p>
             <div className="flex gap-3">
               <button
                 onClick={() => { confirm.resolve(false); setConfirm(null); }}
-                className="flex-1 py-3 rounded-2xl border-2 border-gray-100 text-gray-500 font-bold text-sm hover:bg-gray-50 transition"
+                className="flex-1 py-3 rounded-2xl border-2 border-black/10 dark:border-white/10 text-ink-600 dark:text-ink-300 font-bold text-sm hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={() => { confirm.resolve(true); setConfirm(null); }}
-                className="flex-1 py-3 rounded-2xl text-white font-bold text-sm transition active:scale-95"
-                style={{ background: "linear-gradient(90deg, #1565C0, #0D47A1)" }}
+                className="flex-1 py-3 rounded-2xl text-white font-bold text-sm transition-all active:scale-95 shadow-elevated hover:brightness-110 bg-gradient-to-r from-brand-600 to-brand-700"
               >
                 Confirm
               </button>
